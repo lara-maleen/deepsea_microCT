@@ -1,0 +1,1242 @@
+---
+title: 'microCT vs Histology: Reproductive Trait Comparison'
+author: "Lara Beckmann"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+## 1. LOAD PACKAGES
+
+```{r load-packages}
+library(janitor)      # column name cleaning
+library(dplyr)        # data manipulation
+library(tidyr)        # data reshaping
+library(ggplot2)      # visualisation
+library(lme4)         # mixed-effects models
+library(lmerTest)     # p-values for lmer
+library(emmeans)      # estimated marginal means
+library(performance)  # ICC
+library(see)      # for model check
+```
+
+---
+
+## 2. LOAD AND CLEAN DATA
+
+```{r load-data}
+# Read raw data and clean column names
+data <- read.csv("microCT_measurements_all.csv", header = TRUE) %>%
+  clean_names()
+
+# Quick inspection of dataset structure
+str(data)
+head(data)
+summary(data)
+
+# Ensure Feret diameter is numeric
+data$feret_micron <- as.numeric(data$feret_micron)
+
+# SUBSET GAMETE DATA ONLY
+# Keep only gamete-related measurements (exclude tissue classes like mesohyl/spicules)
+gametes <- data %>%
+  filter(grepl("Gamete", type, ignore.case = TRUE),
+         !is.na(feret_micron))
+
+# Add phylum column for broad taxonomic comparisons
+gametes <- gametes %>%
+  mutate(
+    phylum = ifelse(species == "Paragorgia arborea",
+                    "Cnidaria",
+                    "Porifera")
+  )
+```
+
+---
+
+## 3. DESCRIPTIVE SUMMARY
+
+```{r descriptive-summary}
+# Total gametes measured per method
+gametes %>%
+  group_by(method) %>%
+  summarise(
+    n = n(),
+    mean_feret = mean(feret_micron, na.rm = TRUE),
+    sd_feret = sd(feret_micron, na.rm = TRUE)
+  )
+
+# Raw Feret distributions by method and stage
+ggplot(gametes, aes(x = method, y = feret_micron)) +
+  geom_boxplot() +
+  facet_wrap(~ stage, scales = "free_y") +
+  theme_bw() +
+  labs(x = "Method", y = "Feret diameter (µm)")
+
+
+```
+
+---
+
+## 4. DETECTION LIMIT
+
+```{r detection-limit}
+# ---- 5a. MicroCT detection limits ----
+# Overall minimum
+microCT_limit <- gametes %>%
+  filter(method == "microCT") %>%
+  summarise(min_detected = min(feret_micron, na.rm = TRUE))
+print(microCT_limit)
+
+# By phylum
+microCT_limit_sponges <- gametes %>%
+  filter(method == "microCT", phylum == "Porifera") %>%
+  summarise(min_detected = min(feret_micron, na.rm = TRUE))
+print(microCT_limit_sponges)
+
+microCT_limit_cnidaria <- gametes %>%
+  filter(method == "microCT", phylum == "Cnidaria") %>%
+  summarise(min_detected = min(feret_micron, na.rm = TRUE))
+print(microCT_limit_cnidaria)
+
+# ---- 5b. Histology detection limits ----
+histo_limit <- gametes %>%
+  filter(method == "histology") %>%
+  summarise(min_detected = min(feret_micron, na.rm = TRUE))
+print(histo_limit)
+
+histo_limit_sponges <- gametes %>%
+  filter(method == "histology", phylum == "Porifera") %>%
+  summarise(min_detected = min(feret_micron, na.rm = TRUE))
+print(histo_limit_sponges)
+
+histo_limit_cnidaria <- gametes %>%
+  filter(method == "histology", phylum == "Cnidaria") %>%
+  summarise(min_detected = min(feret_micron, na.rm = TRUE))
+print(histo_limit_cnidaria)
+```
+
+---
+
+## 5. GAMETE COUNTS
+
+```{r gamete-counts}
+
+# ---- 4a. Total counts per specimen and method ----
+counts_table <- gametes %>%
+  group_by(specimen_id, method) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = method, values_from = n, values_fill = 0)
+
+print(counts_table)
+
+# Bar plot: counts per specimen
+ggplot(counts_table, aes(x = specimen_id)) +
+  geom_col(aes(y = microCT, fill = "microCT"), position = position_dodge(0.9)) +
+  geom_col(aes(y = histology, fill = "histology"), position = position_dodge(0.9)) +
+  labs(y = "Number of gametes counted", x = "Specimen", fill = "Method") +
+  theme_bw() +
+  scale_fill_manual(values = c("microCT" = "#1b9e77", "histology" = "#d95f02"))
+
+# ---- 4b. Counts by stage (stacked) ----
+counts_stage <- gametes %>%
+  group_by(specimen_id, method, stage) %>%
+  summarise(n = n(), .groups = "drop")
+
+# Create a combined label for x-axis 
+counts_stage <- counts_stage %>%
+  mutate(specimen_method = paste(specimen_id, method, sep = "."))
+
+ggplot(counts_stage, aes(x = specimen_method, y = n, fill = stage)) +
+  geom_col() +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 8)
+  ) +
+  labs(
+    x = "Specimen / method",
+    y = "Count",
+    fill = "Stage"
+  ) 
+
+# No stats between bars because I then only compare two numbers... I could group the species and then compare the three replicates... 
+
+# ---- 4c. Ratio of microCT to histology counts ----
+counts_table <- counts_table %>%
+  mutate(ratio = ifelse(histology > 0, microCT / histology, NA))
+
+counts_table %>%
+  dplyr::select(specimen_id, microCT, histology, ratio) %>%
+  print()
+
+# Test if normal distribution or not: normality test (if p is below 0.05 then not non-parametric)
+shapiro.test(counts_table$microCT) # = not normal
+shapiro.test(counts_table$histology) # = not normal 
+
+# ---- 4d. Paired statistical tests on counts ----
+# Wilcoxon signed-rank test (non-parametric, robust to outliers)
+wilcox.test(counts_table$microCT, counts_table$histology, paired = TRUE)
+
+# ---- 4e. Phylum-specific count comparison ----
+# Join phylum info to counts_table
+counts_table <- counts_table %>%
+  left_join(
+    gametes %>% dplyr::select(specimen_id, phylum) %>% distinct(),
+    by = "specimen_id"
+  )
+
+# Split into phyla and test
+counts_porifera <- counts_table %>% filter(phylum == "Porifera")
+counts_cnidaria <- counts_table %>% filter(phylum == "Cnidaria")
+
+# Wilcoxon tests for each phylum
+print("Porifera counts (microCT vs histology):")
+wilcox.test(counts_porifera$microCT, counts_porifera$histology, paired = TRUE)
+
+print("Cnidaria counts (microCT vs histology):")
+wilcox.test(counts_cnidaria$microCT, counts_cnidaria$histology, paired = TRUE) #only three samples/numbers, so obviously not significant... 
+
+```
+
+
+## 6. COMPARE COUNTS (>70 µm DETECTION THRESHOLD)
+
+```{r counts-filtered}
+
+# ---- 6a. Filter ----
+gametes_large <- gametes %>% filter(feret_micron > 70)
+
+counts_large <- gametes_large %>%
+  group_by(specimen_id, method) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = method, values_from = n, values_fill = 0) %>%
+  mutate(
+    ratio = ifelse(histology > 0, microCT / histology, NA)
+  ) %>%
+  # Add phylum for grouping
+  left_join(
+    gametes %>% dplyr::select(specimen_id, phylum, species) %>% distinct(),
+    by = "specimen_id"
+  )
+
+print(counts_large)
+
+# ---- 6b. Statistical tests ----
+# Overall (all taxa)
+p_global <- wilcox.test(counts_large$microCT, counts_large$histology, paired = TRUE)$p.value
+p_label_global <- ifelse(p_global < 0.001, "p < 0.001", paste0("p = ", round(p_global, 3)))
+
+# Sponges only
+counts_large_sponges <- counts_large %>% filter(phylum == "Porifera")
+p_sponges <- t.test(counts_large_sponges$microCT, counts_large_sponges$histology, paired = TRUE)$p.value
+p_label_sponges <- ifelse(p_sponges < 0.001, "p < 0.001", paste0("p = ", round(p_sponges, 3)))
+
+# Paragorgia only (ratio, no p-value due to n=3)
+counts_large_coral <- counts_large %>% filter(phylum == "Cnidaria")
+mean_ratio_coral <- mean(counts_large_coral$ratio, na.rm = TRUE)
+
+# ---- 6c. Publication-ready bar plot with annotations ----
+# Reshape for plotting
+counts_large_plot <- counts_large %>%
+  pivot_longer(cols = c(histology, microCT),
+               names_to = "method",
+               values_to = "n")
+
+# Determine max value for annotation placement
+max_n <- max(counts_large_plot$n, na.rm = TRUE)
+
+ggplot(counts_large_plot, aes(x = specimen_id, y = n, fill = method)) +
+  geom_col(position = position_dodge(0.9)) +
+  # Add overall significance annotation
+  annotate("text", x = Inf, y = Inf, 
+           label = paste0("Overall: microCT > histology\n", p_label_global),
+           hjust = 1.1, vjust = 1.5, size = 4, fontface = "italic") +
+  # Add sponges p-value
+  annotate("text", x = 2, y = max_n * 1.15, 
+           label = paste0("Sponges: p = ", round(p_sponges, 3)),
+           size = 3.5, fontface = "italic") +
+  # Add Paragorgia ratio
+  annotate("text", x = 10.5, y = max_n * 1.15, 
+           label = paste0("Paragorgia: ratio = ", round(mean_ratio_coral, 2), "×"),
+           size = 3.5, fontface = "italic") +
+  # Add dashed lines to separate phyla (optional)
+  geom_vline(xintercept = c(3.5, 6.5, 9.5), linetype = "dashed", color = "grey70", alpha = 0.5) +
+  # Add phylum labels
+  annotate("text", x = 2, y = max_n * 1.25, 
+           label = "Sponges (n=9)", fontface = "bold", size = 4) +
+  annotate("text", x = 10.5, y = max_n * 1.25, 
+           label = "Paragorgia (n=3)", fontface = "bold", size = 4) +
+  scale_fill_manual(values = c("histology" = "#d95f02", "microCT" = "#1b9e77")) +
+  theme_bw() +
+  labs(
+    x = "Specimen", 
+    y = "Number of gametes >70 µm",
+    fill = "Method",
+    caption = "Dashed lines separate phyla. Overall comparison: Wilcoxon signed-rank test.\nSponges: paired t-test. Paragorgia: n=3, ratio shown instead of p-value."
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+
+# ---- Filtered counts by stage (stacked) ----
+# Use gametes_large (already filtered to >70 µm)
+counts_stage_filtered <- gametes_large %>%
+  group_by(specimen_id, method, stage) %>%
+  summarise(n = n(), .groups = "drop")
+
+# Create a combined label for x-axis
+counts_stage_filtered <- counts_stage_filtered %>%
+  mutate(specimen_method = paste(specimen_id, method, sep = "."))
+
+# Stacked bar plot
+ggplot(counts_stage_filtered, aes(x = specimen_method, y = n, fill = stage)) +
+  geom_col() +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 8),
+    legend.position = "bottom"
+  ) +
+  labs(
+    x = "Specimen / method",
+    y = "Count (gametes >70 µm)",
+    fill = "Stage"
+  ) +
+  scale_fill_brewer(palette = "Set2", name = "Stage")
+
+# ---- 6d. Sponge-only tests on filtered counts ----
+# Subset to Porifera only
+counts_large_porifera <- counts_large %>% filter(phylum == "Porifera")
+
+shapiro.test(counts_large_porifera$microCT) #not normal so use Wilcox
+shapiro.test(counts_large_porifera$histology) #not normal so use Wilcox 
+
+#Wilcox paired test (non parametric)
+wilcox_test_sponges <- wilcox.test(counts_large_porifera$microCT, 
+                                   counts_large_porifera$histology, 
+                                   paired = TRUE)
+print(wilcox_test_sponges)
+
+# Paired t-test (parametric, robust with n=9) - just to check if it fits with Wilcox test, 
+t_test_sponges <- t.test(counts_large_porifera$microCT, 
+                         counts_large_porifera$histology, 
+                         paired = TRUE)
+print(t_test_sponges)
+
+# ---- View ratios from filtered data ----
+counts_large %>%
+  dplyr::select(specimen_id, phylum, species, histology, microCT, ratio) %>%
+  arrange(phylum, desc(ratio)) %>%
+  print()
+
+```
+
+---
+
+## 7. PAIRED COMPARISON: SPECIMEN × STAGE × METHOD MEANS
+
+```{r aggregate-means}
+# Aggregate to specimen × stage × method means
+# This is the unit of analysis for paired comparisons
+specimen_stage <- gametes %>%
+  group_by(specimen_id, species, phylum, stage, method) %>%
+  summarise(
+    n = n(),
+    mean_feret = mean(feret_micron, na.rm = TRUE),
+    median_feret = median(feret_micron, na.rm = TRUE),
+    sd_feret = sd(feret_micron, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+---
+
+## 8. UNFILTERED ANALYSIS (MAIN MODEL)
+
+```{r unfiltered-analysis}
+
+# ---- 8a. Bland-Altman (unfiltered) ----
+
+paired_raw <- specimen_stage %>%
+  dplyr::select(specimen_id, species, stage, method, mean_feret) %>%
+  pivot_wider(names_from = method, values_from = mean_feret) %>%
+  filter(!is.na(microCT) & !is.na(histology)) %>%
+  mutate(diff = microCT - histology,
+         mean = (microCT + histology) / 2)
+
+# Bland-Altman plot - this is to see how the methods differ. 
+ggplot(paired_raw, aes(x = mean, y = diff)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = mean(paired_raw$diff), linetype = "solid", color = "blue") +
+  geom_hline(yintercept = mean(paired_raw$diff) + 1.96 * sd(paired_raw$diff),
+             linetype = "dashed", color = "red") +
+  geom_hline(yintercept = mean(paired_raw$diff) - 1.96 * sd(paired_raw$diff),
+             linetype = "dashed", color = "red") +
+  labs(x = "Mean feret (µm)", y = "Difference (microCT - histology)") +
+  theme_bw()
+
+# Proportional bias test (unfiltered)
+prop_bias <- lm(diff ~ mean, data = paired_raw) #fitting a linear regression (response = diff, microCT vs histo // predictor = mean)
+summary(prop_bias) # This tests whether the difference between methods changes with the size of the measurement – i.e., whether the bias is proportional to the magnitude of the measurement.
+
+# Visualise the proportional bias: Bland-Altman plot with proportional bias line
+ggplot(paired_raw, aes(x = mean, y = diff)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = mean(paired_raw$diff), linetype = "solid", color = "blue") +
+  geom_hline(yintercept = mean(paired_raw$diff) + 1.96 * sd(paired_raw$diff),
+             linetype = "dashed", color = "red") +
+  geom_hline(yintercept = mean(paired_raw$diff) - 1.96 * sd(paired_raw$diff),
+             linetype = "dashed", color = "red") +
+  geom_smooth(method = "lm", se = TRUE, color = "darkgreen", linetype = "dotted") +  # <-- ADD THIS
+  labs(x = "Mean feret (µm)", y = "Difference (microCT - histology)") +
+  theme_bw()
+
+
+# ---- Bland-Altman summary statistics ----
+mean_diff <- mean(paired_raw$diff, na.rm = TRUE)
+sd_diff <- sd(paired_raw$diff, na.rm = TRUE)
+loa_lower <- mean_diff - 1.96 * sd_diff
+loa_upper <- mean_diff + 1.96 * sd_diff
+
+cat("Mean difference (microCT - histology):", round(mean_diff, 1), "µm\n")
+cat("SD of differences:", round(sd_diff, 1), "µm\n")
+cat("95% limits of agreement: [", round(loa_lower, 1), ",", round(loa_upper, 1), "] µm\n")
+
+
+# ---- 8b. Mixed-effects model (unfiltered) ---- MAIN MODEL
+
+# Main model = liear mixed effects model (method × stage interaction with random intercept per specimen)
+# This tests: Main effect of method: Are microCT measurements systematically different from histology? Main effect of stage: Do # gamete sizes differ across developmental stages? PLus Interaction (method × stage): Does the method difference vary by stage?
+
+model4 <- lmer(feret_micron ~ method * stage + (1 | specimen_id), data = gametes) #The random intercept (1 | specimen_id) accounts for the fact that multiple gametes come from the same specimen.
+summary(model4)
+
+anova(model4, type = 3) #type 3 because it tests each term after all otheer terms, including the interactions (so this needs to be used when interactions are present). Here we test the method vs stage (method:stage = The method difference varies significantly by stage...)
+
+```
+
+# STAGE SPECIFIC CONTRASTS (UNFILTERED DATA)
+```{r}
+
+# ---- 8c. Estimated marginal means and pairwise contrasts for stages ----
+# This is a post-hoc pairwise comparison – the stage‑specific contrasts that form the core of the stage‑specific results 
+
+emm_raw <- emmeans(model4, ~ method | stage)
+contrasts_raw <- contrast(emm_raw, "pairwise", by = "stage", adjust = "tukey")
+print(contrasts_raw)
+
+# ---- Improved boxplot by stage with significance stars ----
+# Extract significance from contrasts_raw
+sig_data <- as.data.frame(contrasts_raw)
+sig_data <- sig_data %>%
+  mutate(
+    star = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE ~ "ns"
+    ),
+    # Calculate y position for stars (max Feret per stage + some offset)
+    y_pos = gametes %>%
+      group_by(stage) %>%
+      summarise(max_feret = max(feret_micron, na.rm = TRUE)) %>%
+      pull(max_feret) * 1.05
+  )
+
+# Plot
+ggplot(gametes, aes(x = method, y = feret_micron, fill = method)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +  # hide outliers for cleaner look
+  geom_point(position = position_jitterdodge(jitter.width = 0.2), 
+             aes(color = method), size = 0.5, alpha = 0.3) +
+  facet_wrap(~ stage, scales = "free_y") +
+  # Add significance stars
+  geom_text(data = sig_data %>% filter(star != "ns"),
+            aes(x = 1.5, y = y_pos, label = star),
+            inherit.aes = FALSE, size = 5, vjust = 0) +
+  scale_fill_manual(values = c("histology" = "#d95f02", "microCT" = "#1b9e77")) +
+  scale_color_manual(values = c("histology" = "#d95f02", "microCT" = "#1b9e77")) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_rect(fill = "white"),
+    legend.position = "none"
+  ) +
+  labs(x = "Method", y = "Feret diameter (µm)", 
+       title = "Size distributions by developmental stage")
+
+
+# ---- 8d. Model diagnostics ----
+plot(model4)          # residuals vs fitted
+qqnorm(resid(model4)); qqline(resid(model4))
+
+```
+
+## 9. FILTERED ANALYSIS: FILTERED TO >70 µm
+
+```{r filtered-analysis}
+
+### Do the same as above, but with the filtered data 
+
+# ---- Combined stages with filtered data ----
+
+# Step 1: Recode stages into combined categories
+gametes_filtered <- gametes %>%
+  filter(feret_micron > 70) %>%
+  mutate(
+    stage_combined = case_when(
+      # Combine vitellogenic oocyte + late oocyte/early embryo (for sponges, since it was difficult to determine them, and makes it comparable to Paragorgia)
+      stage %in% c("vitellogenic oocyte", "late oocyte or early embryo") ~ "Vitellogenic / late oocyte",
+      # Combine prelarva + larva (same, difficult to draw a line...)
+      stage %in% c("prelarva", "larva") ~ "Larva / prelarva",
+      # Keep others as is
+      TRUE ~ stage
+    )
+  )
+
+# Step 2: Refit mixed model with combined stages (= make stats matching)
+# This is optional but recommended if the significance of stars should reflect the combined categories
+model_combined <- lmer(feret_micron ~ method * stage_combined + (1 | specimen_id),
+                       data = gametes_filtered)
+summary(model_combined)
+anova(model_combined, type = 3)
+
+# Step 3: Get contrasts for combined stages
+emm_combined <- emmeans(model_combined, ~ method | stage_combined)
+contrasts_combined <- contrast(emm_combined, "pairwise", by = "stage_combined", adjust = "tukey")
+print(contrasts_combined)
+
+# Step 4: Prepare significance stars for the plot
+sig_data_combined <- as.data.frame(contrasts_combined)
+sig_data_combined <- sig_data_combined %>%
+  mutate(
+    star = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE ~ "ns"
+    )
+  ) %>%
+  # Get y-position for stars
+  left_join(
+    gametes_filtered %>%
+      group_by(stage_combined) %>%
+      summarise(max_feret = max(feret_micron, na.rm = TRUE), .groups = "drop"),
+    by = "stage_combined"
+  ) %>%
+  mutate(y_pos = max_feret * 1.05)
+
+# Step 5: Plot
+ggplot(gametes_filtered, aes(x = method, y = feret_micron, fill = method)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2), 
+             aes(color = method), size = 0.5, alpha = 0.3) +
+  facet_wrap(~ stage_combined, scales = "free_y") +
+  # Add significance stars
+  geom_text(data = sig_data_combined %>% filter(star != "ns"),
+            aes(x = 1.5, y = y_pos, label = star),
+            inherit.aes = FALSE, size = 5, vjust = 0) +
+  # Add "ns" for non‑significant stages
+  geom_text(data = sig_data_combined %>% filter(star == "ns"),
+            aes(x = 1.5, y = y_pos, label = "ns"),
+            inherit.aes = FALSE, size = 4, vjust = 0, color = "grey40") +
+  scale_fill_manual(values = c("histology" = "#d95f02", "microCT" = "#1b9e77")) +
+  scale_color_manual(values = c("histology" = "#d95f02", "microCT" = "#1b9e77")) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_rect(fill = "white"),
+    legend.position = "none"
+  ) +
+  labs(x = "Method", y = "Feret diameter (µm)", 
+       title = "Size distributions by combined developmental stage (gametes >70 µm)")
+
+
+##########
+
+
+# ---- 9a. Filter aggregated means ----
+common <- specimen_stage %>%
+  filter(mean_feret > 70) %>%
+  group_by(specimen_id, stage) %>%
+  filter(n() == 2) %>%  # keep only stages present in both methods
+  ungroup()
+
+# ---- 9b. Bland-Altman (filtered) ----
+paired_filtered <- common %>%
+  dplyr::select(specimen_id, species, stage, method, mean_feret) %>%
+  pivot_wider(names_from = method, values_from = mean_feret) %>%
+  filter(!is.na(microCT) & !is.na(histology)) %>%
+  mutate(diff = microCT - histology,
+         mean = (microCT + histology) / 2)
+
+ggplot(paired_filtered, aes(x = mean, y = diff)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = mean(paired_filtered$diff), linetype = "solid", color = "blue") +
+  geom_hline(yintercept = mean(paired_filtered$diff) + 1.96 * sd(paired_filtered$diff),
+             linetype = "dashed", color = "red") +
+  geom_hline(yintercept = mean(paired_filtered$diff) - 1.96 * sd(paired_filtered$diff),
+             linetype = "dashed", color = "red") +
+  labs(x = "Mean feret (µm)", y = "Difference (microCT - histology)") +
+  theme_bw()
+
+prop_bias_filt <- lm(diff ~ mean, data = paired_filtered)
+summary(prop_bias_filt) # similar to unfiltered data, so still true (signficant)
+
+# ---- 9c. Mixed-effects model (filtered) ----
+# This is a sensitivity analysis using specimen-stage means (not individual gametes).
+# The stage interaction is not significant, confirming that size-filtering removes
+# the stage dependence observed in the unfiltered model.
+m2 <- lmer(mean_feret ~ method * stage + (1 | specimen_id),
+           data = common)
+summary(m2)
+anova(m2, type = 3)
+
+# ---- 9d. Weighted version (by number of gametes per mean) ----
+# Weight by number of gametes per mean; results are consistent with unweighted model.
+
+m2_weighted <- lmer(mean_feret ~ method * stage + (1 | specimen_id),
+                    data = common, weights = n)
+summary(m2_weighted)
+
+# ---- 9e. Effect sizes and percentage bias ----
+
+# We are using emmeans, because this uses the model to predict what the mean would be for each stage‑method combination, adjusted for the random effects (specimen variation) and balanced across stages. This gives a fair comparison that accounts for the hierarchical structure of your data. If only raw means, then it doesnt account for differences in sample sizes... mean will be influenced by sample size... 
+
+
+common <- common %>%
+  mutate(
+    stage_combined = case_when(
+      stage %in% c("vitellogenic oocyte", "late oocyte or early embryo") ~ "Vitellogenic / late oocyte",
+      stage %in% c("prelarva", "larva") ~ "Larva / prelarva",
+      TRUE ~ as.character(stage)
+    ),
+    stage_combined = factor(stage_combined,
+                            levels = c("previtellogenic oocyte",
+                                       "Vitellogenic / late oocyte",
+                                       "embryo",
+                                       "Larva / prelarva"))
+  )
+#reaggregate because somehow I got duplicates above...
+common <- common %>%
+  group_by(specimen_id, species, stage_combined, method) %>%
+  summarise(
+    mean_feret = mean(mean_feret),
+    n = sum(n),
+    .groups = "drop"
+  ) %>%
+  group_by(specimen_id, stage_combined) %>%
+  filter(n() == 2) %>%     # keep only stage-specimen combos in both methods
+  ungroup()
+
+# Sanity check: should return zero rows
+common %>%
+  dplyr::count(specimen_id, stage_combined, method) %>%
+  filter(n > 1)
+
+
+m2_combined <- lmer(mean_feret ~ method * stage_combined + (1 | specimen_id),
+                    data = common)
+anova(m2_combined, type = 3)
+summary(m2_combined)
+
+emm_m2c <- emmeans(m2_combined, ~ method | stage_combined)  # Computes the estimated marginal means (model‑predicted averages) for each method within each stage from the filtered model (m2).
+contrasts_m2c <- contrast(emm_m2c, "pairwise", by = "stage_combined") #Compares the two methods (histology vs microCT) separately for each stage. The contrast is histology - microCT (so a negative estimate means microCT is larger).
+summary(contrasts_m2c, by = NULL, adjust = "holm")
+
+
+hist_means <- as.data.frame(emm_m2c) %>%
+  filter(method == "histology") %>%
+  dplyr::select(stage_combined, hist_mean = emmean)
+
+#
+
+# ---- 9f. Model diagnostics for filtered model ----
+plot(m2)          # residuals vs fitted
+qqnorm(resid(m2))
+qqline(resid(m2))
+
+
+
+# On combined stages:
+
+# Histology emmeans
+hist_em <- as.data.frame(emm_combined) %>%
+  filter(method == "histology") %>%
+  dplyr::select(stage_combined, hist_mean = emmean)
+
+# Contrasts (histology - microCT)
+contr <- as.data.frame(contrasts_combined) %>%
+  mutate(microCT_minus_histology = -estimate)  # positive = microCT larger
+
+# Join and compute percent bias
+pct_table <- left_join(contr, hist_em, by = "stage_combined") %>%
+  mutate(percent_bias = (microCT_minus_histology / hist_mean) * 100) %>%
+  dplyr::select(stage_combined, contrast_est = estimate, hist_mean, 
+                microCT_minus_histology, percent_bias)
+pct_table
+
+# Overall marginal means averaged over stages
+emm_all <- emmeans(model_combined, ~ method)
+emm_tab <- as.data.frame(emm_all)
+(overall_pct <- (emm_tab$emmean[2] - emm_tab$emmean[1]) / emm_tab$emmean[1] * 100)
+pairs(emm_all)
+
+
+```
+
+---
+
+# 10. SPECIES AND PHYLUM EFFECTS
+
+```{r species-phylum-effects}
+
+# ---- 10a. Species as a fixed effect ----
+# Check how the species differed, so adding species into the linear mixed effects model: 
+
+model_species <- lmer(feret_micron ~ method * species + stage + (1 | specimen_id),
+                      data = gametes)
+summary(model_species)
+anova(model_species, type = 3)
+
+# ---- Pairwise contrasts per species ----
+# Use unweighted emmeans for contrasts (the differences are the same)
+emm_species <- emmeans(model_species, ~ method | species)
+contrasts_species <- contrast(emm_species, "pairwise", by = "species", adjust = "tukey")
+print(contrasts_species)
+
+# ---- Species-specific means with weighted emmeans ----
+# Use weights = "cells" to average only over stages that exist in each species.
+# This prevents the model from extrapolating to stages that are absent (e.g., 
+# prelarva and late oocyte/early embryo in Paragorgia).
+emm_species_weighted <- emmeans(model_species, ~ method | species, weights = "cells")
+emm_species_df <- as.data.frame(emm_species_weighted)
+
+# ---- Annotation: significance stars ----
+# All pairwise contrasts are significant (p < 0.001), so we place "***" above each species.
+annotation_species <- emm_species_df %>%
+  group_by(species) %>%
+  summarise(
+    y_star = max(upper.CL) + 30,  # 30 µm above the highest error bar
+    .groups = "drop"
+  )
+
+# ---- Publication-ready species plot ----
+ggplot(emm_species_df, aes(x = species, y = emmean, color = method)) +
+  geom_point(position = position_dodge(0.2), size = 3) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+                position = position_dodge(0.2), width = 0.2, linewidth = 0.8) +
+  # Significance stars
+  geom_text(data = annotation_species,
+            aes(x = species, y = y_star, label = "***"),
+            color = "black", size = 5, inherit.aes = FALSE) +
+  scale_color_manual(values = c("histology" = "#d95f02", "microCT" = "#1b9e77"),
+                     name = "Method") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    legend.position = "top"
+  ) +
+  labs(
+    y = "Estimated mean Feret diameter (µm)",
+    x = "Species",
+    caption = "*** p < 0.001 for histology vs. microCT within each species (Tukey-adjusted).\nMeans are weighted estimated marginal means (emmeans) adjusted for developmental stage,\nweighted by the observed stage distribution per species (stages absent from a species are excluded)."
+  )
+
+# ---- 10b. Phylum effects ----
+model_group <- lmer(feret_micron ~ method * phylum * stage + (1 | specimen_id),
+                    data = gametes)
+summary(model_group)
+anova(model_group)
+
+model_phylum <- lmer(feret_micron ~ method * phylum + (1 | specimen_id),
+                     data = gametes)
+summary(model_phylum)
+anova(model_phylum)
+```
+
+###10.2 SAME AS ABOVE BUT FILTERED 
+
+```{r}
+# ---- 10a. Species as a fixed effect (FILTERED DATA >70 µm) ----
+# Use gametes_large (already filtered to >70 µm)
+model_species_filtered <- lmer(feret_micron ~ method * species + stage + (1 | specimen_id),
+                               data = gametes_large)
+summary(model_species_filtered)
+anova(model_species_filtered, type = 3)
+
+# ---- Pairwise contrasts per species (filtered) ----
+emm_species_filtered <- emmeans(model_species_filtered, ~ method | species)
+contrasts_species_filtered <- contrast(emm_species_filtered, "pairwise", by = "species", adjust = "tukey")
+print(contrasts_species_filtered)
+
+# ---- Species-specific means with weighted emmeans (filtered) ----
+# Use weights = "cells" to average only over stages that exist in each species.
+emm_species_weighted_filtered <- emmeans(model_species_filtered, ~ method | species, weights = "cells")
+emm_species_df_filtered <- as.data.frame(emm_species_weighted_filtered)
+
+# ---- Annotation: significance stars ----
+annotation_species_filtered <- emm_species_df_filtered %>%
+  group_by(species) %>%
+  summarise(
+    y_star = max(upper.CL) + 30,
+    .groups = "drop"
+  )
+
+# ---- Publication-ready species plot (filtered) ----
+ggplot(emm_species_df_filtered, aes(x = species, y = emmean, color = method)) +
+  geom_point(position = position_dodge(0.2), size = 3) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+                position = position_dodge(0.2), width = 0.2, linewidth = 0.8) +
+  geom_text(data = annotation_species_filtered,
+            aes(x = species, y = y_star, label = "***"),
+            color = "black", size = 5, inherit.aes = FALSE) +
+  scale_color_manual(values = c("histology" = "#d95f02", "microCT" = "#1b9e77"),
+                     name = "Method") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    legend.position = "top"
+  ) +
+  labs(
+    y = "Estimated mean Feret diameter (µm)",
+    x = "Species",
+    caption = "*** p < 0.001 for histology vs. microCT within each species (Tukey-adjusted).\nData restricted to gametes >70 µm. Means are weighted estimated marginal means (emmeans)\nadjusted for developmental stage, weighted by the observed stage distribution per species."
+  )
+
+# ---- 10b. Phylum effects (filtered) ----
+model_group_filtered <- lmer(feret_micron ~ method * phylum * stage + (1 | specimen_id),
+                             data = gametes_large)
+summary(model_group_filtered)
+anova(model_group_filtered)
+
+model_phylum_filtered <- lmer(feret_micron ~ method * phylum + (1 | specimen_id),
+                              data = gametes_large)
+summary(model_phylum_filtered)
+anova(model_phylum_filtered)
+
+
+# Check the performances of the tests/data:
+library(see)
+performance::check_model(model_combined) 
+performance::check_model(model_species_filtered)
+performance::check_model(model_phylum_filtered)
+
+
+#Also do this to get the p-values:
+# Adjust across all four stage-specific method contrasts
+summary(contrasts_combined, by = NULL, adjust = "holm")
+# Adjust across all four species-specific method contrasts
+summary(contrasts_species_filtered, by = NULL, adjust = "holm")
+# Phylum-specific contrasts
+emm_phylum_filtered <- emmeans(
+  model_phylum_filtered,
+  ~ method | phylum
+)
+
+contrasts_phylum_filtered <- contrast(
+  emm_phylum_filtered,
+  "pairwise",
+  by = "phylum"
+)
+
+summary(contrasts_phylum_filtered, by = NULL, adjust = "holm")
+
+```
+
+###10.3 INDIVIDUAL EFFECTS
+
+```{r}
+
+#Whats the effect of the specimen intercept? 
+
+library(RLRsim)
+ 
+# 1. Overall and combined-stage contrasts
+test_individual_combined <- exactRLRT(
+    model_combined, nsim = 10000, seed = 101)
+
+# 2. Species contrasts
+test_individual_species <- exactRLRT(
+     model_species_filtered, nsim = 10000, seed = 102)
+
+# 3. Phylum contrasts
+test_individual_phylum <- exactRLRT(
+     model_phylum_filtered, nsim = 10000, seed = 103)
+
+# Print the three tests
+test_individual_combined
+test_individual_species
+test_individual_phylum
+
+
+### Also just to satsify anyone arguing with the model:
+#Using RANOVA, which produces the exact same values :) 
+
+ranova(model_combined)
+ranova(model_species_filtered)
+ranova(model_phylum_filtered)
+
+
+```
+
+---
+
+## 11. SPECIMEN-LEVEL VARIATION 
+
+```{r}
+
+# ---- Supp Fig 1 (split by method):  ----
+
+# species_cols stays the same as your original
+species_cols <- c(
+  "Monanchora pulchra" = "#7570b3",
+  "Paragorgia arborea" = "#d95f02",
+  "Stelodoryx oxeata"  = "#1b9e77",
+  "Tedania kagalaskai" = "#e7298a"
+)
+
+# Build the combined facet label with explicit ordering
+gametes_large <- gametes_large %>%
+  mutate(
+    species_method = factor(
+      paste(species, method, sep = " | "),
+      levels = as.vector(t(outer(
+        c("Monanchora pulchra", "Paragorgia arborea",
+          "Stelodoryx oxeata",  "Tedania kagalaskai"),
+        c("histology", "microCT"),
+        paste, sep = " | "
+      )))
+    )
+  )
+
+p_supp1 <- ggplot(gametes_large,
+                  aes(x = specimen_id, y = feret_micron, fill = species)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.75, width = 0.7) +
+  geom_point(position = position_jitter(width = 0.15),
+             size = 0.4, alpha = 0.35, colour = "grey25") +
+  stat_summary(fun = mean, geom = "point",
+               shape = 18, size = 2.5, colour = "black") +
+  facet_wrap(~ species_method, scales = "free_x", nrow = 1) +
+  scale_fill_manual(values = species_cols) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_rect(fill = "white"),
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    x = "Specimen (individual)",
+    y = "Feret diameter (µm)",
+    title = "Individual variation in gamete size per species and method (gametes >70 µm)",
+    caption = "Panels run left to right: each species is shown for histology then microCT. Grey dots = individual measurements, black diamonds = individual means."
+  )
+
+p_supp1
+
+
+# ---- Supp Fig 2 (split by method): 
+
+# 12 specimen colours (same as your original)
+specimen_cols <- c(
+  "P0209" = "#1b9e77", "P0213" = "#66c2a5", "P0216" = "#006d2c",
+  "O0121" = "#d95f02", "O0128" = "#e7298a", "O0133" = "#fc8d62",
+  "P0235" = "#7570b3", "P0251" = "#984ea3", "P0270" = "#bcbddc",
+  "P0003" = "#e6ab02", "P0012" = "#a6761d", "P0253" = "#ffd92f"
+)
+
+# Build the combined facet label with explicit ordering
+gametes_large <- gametes_large %>%
+  mutate(
+    species_method = factor(
+      paste(species, method, sep = " | "),
+      levels = as.vector(t(outer(
+        c("Monanchora pulchra", "Paragorgia arborea",
+          "Stelodoryx oxeata",  "Tedania kagalaskai"),
+        c("histology", "microCT"),
+        paste, sep = " | "
+      )))
+    )
+  )
+
+# Set specimen order to match the specimen colour palette
+specimen_levels <- names(specimen_cols)
+
+p_supp2 <- ggplot(gametes_large,
+                  aes(x = stage, y = feret_micron, fill = specimen_id)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.85,
+               position = position_dodge(preserve = "single")) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.08,
+                                             dodge.width = 0.75),
+             size = 0.35, alpha = 0.25, colour = "grey25") +
+  facet_wrap(~ species_method, scales = "free_x", nrow = 1) +
+  scale_fill_manual(values = specimen_cols, name = "Specimen") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  ) +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+  labs(
+    x = "Developmental stage",
+    y = "Feret diameter (µm)",
+    title = "Gamete size by stage, method and individual (gametes >70 µm)",
+    caption = "Panels run left to right: each species is shown for histology then microCT. Each boxplot = one individual; colours distinguish the three specimens per species."
+  )
+
+p_supp2
+
+
+# Make sure gametes_filtered has the same factor levels / column
+gametes_filtered <- gametes_filtered %>%
+  mutate(
+    specimen_id = factor(specimen_id, levels = specimen_levels),
+    species     = factor(species, levels = c("Monanchora pulchra",
+                                             "Paragorgia arborea",
+                                             "Stelodoryx oxeata",
+                                             "Tedania kagalaskai")),
+    species_method = factor(
+      paste(species, method, sep = " | "),
+      levels = as.vector(t(outer(
+        c("Monanchora pulchra", "Paragorgia arborea",
+          "Stelodoryx oxeata",  "Tedania kagalaskai"),
+        c("histology", "microCT"),
+        paste, sep = " | "
+      )))
+    )
+  )
+
+p_supp2_combined <- ggplot(gametes_filtered,
+                           aes(x = stage_combined, y = feret_micron,
+                               fill = specimen_id)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8,
+               position = position_dodge(preserve = "single")) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.08,
+                                             dodge.width = 0.75),
+             size = 0.35, alpha = 0.25, colour = "grey25") +
+  facet_wrap(~ species_method, scales = "free_x", nrow = 1) +
+  scale_fill_manual(values = specimen_cols, name = "Specimen") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  ) +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+  labs(
+    x = "Developmental stage (combined)",
+    y = "Feret diameter (µm)",
+    title = "Gamete size by combined stage, method and individual (gametes >70 µm)",
+    caption = "Panels run left to right: each species is shown for histology then microCT."
+  )
+
+p_supp2_combined
+
+
+
+```
+
+
+(ICC) - maybe not needed, since I have too few specimens
+
+```{r icc}
+
+#Using ICC = Intraclass Correlation Coefficient Analysis
+#Can say how much of the total variation in gamete size is due to differences between specimens (as opposed to variation within specimens, e.g., between stages or measurement error). ICC measures clustering – how similar measurements are within the same specimen compared to measurements from different specimens.
+# So 0 = no variation, all specimens are identical
+# If ICC > 0.5 then high, specimens are very different from eachother
+
+# ---- 11a. ICC for filtered model ----
+icc(m2) # here, for example adjusted ICC is 0.09, and unadjusted is 0.018 - after accounting for method and stage, only 9.4% of the remaining variation in gamete size is due to differences between specimens. This means: Most of the variation is within specimens – i.e., between developmental stages or due to measurement error. Specimens are fairly similar to each other once you account for stage and method. 
+
+# Unadjusted ICC = the proportion of variance explained by the random effect without accounting for fixed effects (method and stage). The adjusted ICC accounts for fixed effects. Since method and stage explain a lot of variance, the adjusted ICC is higher (more variance is left for the random effect to explain after fixed effects are accounted for).
+
+
+# ---- 11b. Phylum-specific ICC ----
+icc_porifera <- performance::icc(
+  lmer(feret_micron ~ method + stage + (1 | specimen_id),
+       data = gametes %>% filter(phylum == "Porifera"))
+)
+print("ICC for Porifera:")
+print(icc_porifera) # here: In sponges, 16.1% of the variation is between specimens. but here, we also have three species... 
+
+icc_cnidaria <- performance::icc(
+  lmer(feret_micron ~ method + stage + (1 | specimen_id),
+       data = gametes %>% filter(phylum == "Cnidaria"))
+)
+print("ICC for Cnidaria:")
+print(icc_cnidaria)
+
+# ---- 11c. Overall ICC (all data) ----
+icc_overall <- performance::icc(
+  lmer(feret_micron ~ method + stage + (1 | specimen_id),
+       data = gametes)
+)
+print("ICC for all data:")
+print(icc_overall)
+
+#Interpretation: Within each phylum, specimens are quite similar (low ICC). Between phyla, there is a large biological difference, which inflates the overall ICC. This supports the conclusion that most size variation is within specimens (stage differences) rather than between individuals.
+
+```
+
+---
+
+## 12. OVERALL BIAS SUMMARY
+
+```{r bias-summary}
+
+# Using filtered paired data
+paired_filtered %>%
+  summarise(
+    mean_bias = mean(diff, na.rm = TRUE),
+    sd_bias = sd(diff, na.rm = TRUE),
+    n = n()
+  )
+
+# Overall percentage bias
+mean(paired_filtered$diff / paired_filtered$histology, na.rm = TRUE) * 100
+
+# Stage-specific bias
+paired_filtered %>%
+  group_by(stage) %>%
+  summarise(
+    mean_bias = mean(diff, na.rm = TRUE),
+    percent_bias = mean((microCT - histology) / histology, na.rm = TRUE) * 100
+  )
+
+gametes_filtered %>% dplyr::count(stage_combined, method)
+emm_phylum <- emmeans(model_phylum_filtered, ~ method | phylum)
+contrast(emm_phylum, "pairwise", by = "phylum", adjust = "tukey")
+
+
+```
+
+---
+
+## 13. FECUNDITY (SPONGES)
+
+```{r fecundity}
+# Using microCT data only
+microct_data <- data %>% filter(method == "microCT")
+
+gamete_counts <- microct_data %>%
+  filter(grepl("Gamete", type, ignore.case = TRUE)) %>%
+  group_by(specimen_id) %>%
+  summarise(n_gametes = n(), .groups = "drop")
+
+tissue_volume <- microct_data %>%
+  filter(type %in% c("Mesohyl", "Spicules")) %>%
+  group_by(specimen_id) %>%
+  summarise(tissue_volume = sum(volume, na.rm = TRUE), .groups = "drop")
+
+fecundity <- gamete_counts %>%
+  left_join(tissue_volume, by = "specimen_id") %>%
+  mutate(
+    gamete_density = n_gametes / tissue_volume,
+    gamete_density_log = log(gamete_density)
+  )
+
+print(fecundity)
+
+# Optional fecundity plot (commented out)
+ggplot(fecundity, aes(x = specimen_id, y = gamete_density)) +
+geom_col() + labs(y = "Gamete density (per µm³)", x = "Specimen") + theme_bw()
+
+```
+
+---
+
+## 14. PARAGORGIA SIZE DISTRIBUTION (ADDITIONAL MUSEUM DATA)
+
+```{r paragorgia-histogram}
+# Load museum specimen data (additional microCT measurements)
+museum <- read.csv("Paragorgia_microCT_museum.csv")
+
+# Clean museum column names (if not already clean)
+names(museum) <- c(
+  "specimen_id", "species_replicate", "phylum", "species", "stage",
+  "type", "measurement", "volume", "surface_area_lindblad_2005_mm2",
+  "aspect_ratio", "feret_min_mm", "feret_mean_mm", "feret_max_mm",
+  "feret_micron", "notes", "annotation_method", "method"
+)
+
+# Subset Paragorgia microCT data from main dataset
+paragorgia_microCT <- gametes[
+  gametes$species == "Paragorgia arborea" &
+  gametes$method == "microCT",
+]
+
+# Combine with museum data
+paragorgia_all <- rbind(paragorgia_microCT, museum)
+
+# Plot: density with stage-coloured rug
+ggplot(paragorgia_all, aes(x = feret_micron)) +
+
+  # Developmental stage zones (background shading)
+  annotate("rect", xmin = 0, xmax = 400,  ymin = -Inf, ymax = Inf,
+           fill = "#1b9e77", alpha = 0.05) +
+  annotate("rect", xmin = 400, xmax = 900, ymin = -Inf, ymax = Inf,
+           fill = "#d95f02", alpha = 0.05) +
+  annotate("rect", xmin = 900, xmax = 2000, ymin = -Inf, ymax = Inf,
+           fill = "#7570b3", alpha = 0.05) +
+
+  # Kernel density estimates (coloured by specimen)
+  geom_density(aes(fill = specimen_id), alpha = 0.15, color = NA) +
+
+  # Rug plot (individual observations coloured by stage)
+  geom_rug(aes(color = stage), sides = "b", alpha = 0.5, linewidth = 0.35) +
+
+  scale_fill_brewer(palette = "Set2") +
+  scale_color_manual(values = c(
+    "previtellogenic oocyte" = "#1b9e77",
+    "vitellogenic oocyte"    = "#d95f02",
+    "embryo"                 = "#7570b3",
+    "larva"                  = "#e7298a",
+    "prelarva"               = "#66a61e"
+  )) +
+
+  theme_classic() +
+  labs(
+    x = "Feret diameter (µm)",
+    y = "Density",
+    fill = "Specimen",
+    color = "Stage"
+  )
+
+# ---- Summary statistics for Paragorgia stages ----
+paragorgia_stats <- gametes %>%
+  filter(species == "Paragorgia arborea") %>%
+  group_by(method, stage) %>%
+  summarise(
+    n = n(),
+    mean_feret = mean(feret_micron, na.rm = TRUE),
+    sd_feret = sd(feret_micron, na.rm = TRUE),
+    min_feret = min(feret_micron, na.rm = TRUE),
+    max_feret = max(feret_micron, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(stage, method)
+
+print(paragorgia_stats)
+
+
+```
+
+---
+
+## 15. SESSION INFO
+
+```{r session-info}
+sessionInfo()
+```
